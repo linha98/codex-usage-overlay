@@ -1,0 +1,15 @@
+.build-tools/
+build/
+dist/
+__pycache__/
+*.py[cod]
+*.spec
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+*.log
+.DS_Store
+.idea/
+.vscode/

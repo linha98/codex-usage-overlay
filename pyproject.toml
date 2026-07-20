@@ -1,0 +1,14 @@
+[project]
+name = "codex-usage-overlay"
+version = "1.0.0"
+description = "Windows Codex 用量与任务状态悬浮窗"
+requires-python = ">=3.10"
+dependencies = [
+    "pywin32==308; platform_system == 'Windows'",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
