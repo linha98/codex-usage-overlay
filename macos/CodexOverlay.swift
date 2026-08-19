@@ -1,4 +1,6 @@
 import AppKit
+import ApplicationServices
+import CoreGraphics
 import Foundation
 import ServiceManagement
 
@@ -15,9 +17,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var usageClient = CodexUsageClient()
     private var resetClient = ResetCreditsClient()
     private var refreshTimer: Timer?
+    private var fullscreenTimer: Timer?
     private var usage = 0.0
     private var activity = ActivitySnapshot.idle
     private var isClickThrough = false
+    private var manuallyHidden = false
+    private var automaticallyHidden = false
+    private var autoHideInFullscreen = UserDefaults.standard.object(forKey: "autoHideInFullscreen") as? Bool ?? true
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 双击启动时应有明确可见反馈；菜单栏图标仍会同时保留。
@@ -29,11 +35,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
-        showPanel()
+        if autoHideInFullscreen { FullscreenDetector.requestAccessibilityIfNeeded() }
+        initializeVisibility()
         performRefresh(forceReset: true)
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.performRefresh(forceReset: false)
         }
+        fullscreenTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            self?.updateFullscreenVisibility()
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(handleSystemWake),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleScreenChange),
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: nil
+        )
     }
 
     func applicationWillTerminate(_ notification: Notification) { usageClient.stop() }
@@ -45,6 +67,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         let clickItem = menu.addItem(withTitle: "鼠标穿透", action: #selector(toggleClickThrough), keyEquivalent: "")
         clickItem.state = isClickThrough ? .on : .off
+        let fullscreenItem = menu.addItem(withTitle: "全屏时自动隐藏", action: #selector(toggleAutoHideInFullscreen), keyEquivalent: "")
+        fullscreenItem.target = self
+        fullscreenItem.state = autoHideInFullscreen ? .on : .off
+        if autoHideInFullscreen {
+            if AXIsProcessTrusted() {
+                let permissionItem = menu.addItem(withTitle: "网页全屏检测：已启用", action: nil, keyEquivalent: "")
+                permissionItem.isEnabled = false
+            } else {
+                menu.addItem(withTitle: "网页全屏检测：需要辅助功能权限", action: #selector(openAccessibilitySettings), keyEquivalent: "")
+            }
+        }
         if #available(macOS 13.0, *) {
             let launchItem = menu.addItem(withTitle: "登录时打开", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
             launchItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -54,6 +87,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func showPanel() {
+        manuallyHidden = false
+        automaticallyHidden = false
         NSApp.activate(ignoringOtherApps: true)
         panel.orderFrontRegardless()
     }
@@ -63,6 +98,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func performRefresh(forceReset: Bool) {
+        panel.restoreSavedSizeIfNeeded()
         panel.setConnection("正在读取 Codex 用量…")
         usageClient.refresh { [weak self] result in
             DispatchQueue.main.async {
@@ -96,6 +132,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.ignoresMouseEvents = isClickThrough
     }
 
+    @objc private func toggleAutoHideInFullscreen() {
+        autoHideInFullscreen.toggle()
+        UserDefaults.standard.set(autoHideInFullscreen, forKey: "autoHideInFullscreen")
+        if autoHideInFullscreen {
+            FullscreenDetector.requestAccessibilityIfNeeded()
+            updateFullscreenVisibility()
+        } else if automaticallyHidden {
+            automaticallyHidden = false
+            if !manuallyHidden { panel.orderFrontRegardless() }
+        }
+    }
+
+    @objc private func openAccessibilitySettings() {
+        FullscreenDetector.requestAccessibilityIfNeeded()
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     @available(macOS 13.0, *) @objc func toggleLaunchAtLogin() {
         do {
             if SMAppService.mainApp.status == .enabled { try SMAppService.mainApp.unregister() }
@@ -105,7 +159,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func quit() { NSApp.terminate(nil) }
 
-    @objc func hidePanel() { panel.orderOut(nil) }
+    @objc func hidePanel() {
+        manuallyHidden = true
+        automaticallyHidden = false
+        panel.orderOut(nil)
+    }
+
+    private func updateFullscreenVisibility() {
+        guard autoHideInFullscreen else { return }
+        let state = FullscreenDetector.inspectFrontmostApp(
+            excludingPID: ProcessInfo.processInfo.processIdentifier
+        )
+        let fullscreen = state.coversDisplay || state.likelyWebVideoFullscreen
+        if fullscreen {
+            automaticallyHidden = true
+            if panel.isVisible {
+                panel.orderOut(nil)
+            }
+        } else if automaticallyHidden {
+            automaticallyHidden = false
+            if !manuallyHidden { panel.orderFrontRegardless() }
+        }
+    }
+
+    private func initializeVisibility() {
+        // 常规 Dock 应用启动时会被系统自动激活；先退回后台，再检查原本的前台窗口。
+        NSApp.deactivate()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self else { return }
+            self.updateFullscreenVisibility()
+            if !self.automaticallyHidden && !self.manuallyHidden {
+                self.panel.orderFrontRegardless()
+            }
+        }
+    }
+
+    @objc private func handleSystemWake() {
+        // 屏幕恢复后 AppKit 还会继续重排一小段时间，延后校正可避免再次被覆盖。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            self?.panel.restoreSavedSizeIfNeeded(force: true)
+        }
+    }
+
+    @objc private func handleScreenChange() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.panel.restoreSavedSizeIfNeeded(force: true)
+        }
+    }
 
     private func updateMenuTitle() {
         statusItem.button?.toolTip = "Codex \(activity.title) · 用量 \(Int(usage.rounded()))%"
@@ -116,26 +216,228 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
-private final class OverlayPanel: NSPanel {
-    static let defaultSize = NSSize(width: 160, height: 78)
-    static let minimumSize = NSSize(width: 146, height: 70)
+private enum FullscreenDetector {
+    struct State {
+        let pid: pid_t?
+        let coversDisplay: Bool
+        let coversVisibleArea: Bool
+        let likelyWebVideoFullscreen: Bool
+        static let none = State(pid: nil, coversDisplay: false, coversVisibleArea: false, likelyWebVideoFullscreen: false)
+    }
+
+    static func inspectFrontmostApp(excludingPID: pid_t) -> State {
+        guard let application = NSWorkspace.shared.frontmostApplication else { return .none }
+        let pid = application.processIdentifier
+        guard pid != excludingPID else { return .none }
+
+        guard let rawWindows = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return State(pid: pid, coversDisplay: false, coversVisibleArea: false, likelyWebVideoFullscreen: false)
+        }
+
+        let screenRegions = NSScreen.screens.compactMap { screen -> (display: CGRect, visible: CGRect)? in
+            let key = NSDeviceDescriptionKey("NSScreenNumber")
+            guard let number = screen.deviceDescription[key] as? NSNumber else { return nil }
+            let display = CGDisplayBounds(CGDirectDisplayID(number.uint32Value))
+            let visible = screen.visibleFrame
+            let screenFrame = screen.frame
+            let visibleInQuartz = CGRect(
+                x: display.minX + visible.minX - screenFrame.minX,
+                y: display.minY + screenFrame.maxY - visible.maxY,
+                width: visible.width,
+                height: visible.height
+            )
+            return (display, visibleInQuartz)
+        }
+
+        var coversDisplay = false
+        var visibleAreaWindows: [CGRect] = []
+        for window in rawWindows {
+            guard (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid,
+                  (window[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+                  ((window[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1) > 0.05,
+                  let boundsDictionary = window[kCGWindowBounds as String] as? [String: Any],
+                  let bounds = CGRect(dictionaryRepresentation: boundsDictionary as CFDictionary),
+                  bounds.width > 0, bounds.height > 0 else { continue }
+
+            for region in screenRegions {
+                if coversRegion(window: bounds, region: region.display, tolerance: 0.985) {
+                    coversDisplay = true
+                }
+                if matchesVisibleArea(window: bounds, visible: region.visible) {
+                    visibleAreaWindows.append(bounds)
+                }
+            }
+        }
+        let mediaBundles: Set<String> = [
+            "com.google.Chrome", "com.google.Chrome.canary", "com.apple.Safari",
+            "org.mozilla.firefox", "com.microsoft.edgemac", "com.brave.Browser",
+            "com.operasoftware.Opera", "com.apple.QuickTimePlayerX",
+            "org.videolan.vlc", "com.colliderli.iina"
+        ]
+        let isMediaApplication = mediaBundles.contains(application.bundleIdentifier ?? "")
+        let coversVisibleArea = !visibleAreaWindows.isEmpty
+        let toolbarVisibility = isMediaApplication
+            ? browserToolbarIsVisible(pid: pid, matching: visibleAreaWindows)
+            : nil
+        // 网页全屏与普通最大化可能拥有完全相同的窗口尺寸；未获辅助功能权限时不做猜测。
+        let likelyWebVideoFullscreen = coversVisibleArea && isMediaApplication && toolbarVisibility == false
+        return State(
+            pid: pid,
+            coversDisplay: coversDisplay,
+            coversVisibleArea: coversVisibleArea,
+            likelyWebVideoFullscreen: likelyWebVideoFullscreen
+        )
+    }
+
+    private static func coversRegion(window: CGRect, region: CGRect, tolerance: CGFloat) -> Bool {
+        let intersection = window.intersection(region)
+        guard !intersection.isNull, region.width > 0, region.height > 0 else { return false }
+        return intersection.width / region.width >= tolerance && intersection.height / region.height >= tolerance
+    }
+
+    private static func matchesVisibleArea(window: CGRect, visible: CGRect) -> Bool {
+        guard coversRegion(window: window, region: visible, tolerance: 0.98) else { return false }
+        return abs(window.minX - visible.minX) <= 10 &&
+            abs(window.maxX - visible.maxX) <= 10 &&
+            abs(window.minY - visible.minY) <= 10 &&
+            abs(window.maxY - visible.maxY) <= 12
+    }
+
+    static func requestAccessibilityIfNeeded() {
+        guard !AXIsProcessTrusted() else { return }
+        let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+        AXIsProcessTrustedWithOptions([promptKey: true] as CFDictionary)
+    }
+
+    private static func browserToolbarIsVisible(pid: pid_t, matching candidates: [CGRect]) -> Bool? {
+        guard AXIsProcessTrusted() else { return nil }
+        let application = AXUIElementCreateApplication(pid)
+
+        // Chrome 可能同时有多个窗口；必须检查与 CGWindow 全屏候选尺寸相符的窗口，
+        // 不能只读 focusedWindow（切换 Space 或播放器全屏时它可能仍指向另一个普通窗口）。
+        var windowsValue: CFTypeRef?
+        if AXUIElementCopyAttributeValue(
+            application,
+            kAXWindowsAttribute as CFString,
+            &windowsValue
+        ) == .success,
+        let windows = windowsValue as? [AXUIElement] {
+            let matchingWindows = windows.filter { window in
+                guard let bounds = accessibilityBounds(of: window) else { return false }
+                return candidates.contains { approximatelyEqual(bounds, $0) }
+            }
+            if !matchingWindows.isEmpty {
+                for window in matchingWindows {
+                    var inspected = 0
+                    if containsVisibleToolbar(window, depth: 0, inspected: &inspected) { return true }
+                }
+                return false
+            }
+        }
+
+        // 某些播放器不会把全屏窗口列入 AXWindows，保留 focusedWindow 作为兼容回退。
+        var focusedValue: CFTypeRef?
+        let focusedResult = AXUIElementCopyAttributeValue(
+            application,
+            kAXFocusedWindowAttribute as CFString,
+            &focusedValue
+        )
+        guard focusedResult == .success, let focusedValue else { return nil }
+        let window = unsafeBitCast(focusedValue, to: AXUIElement.self)
+        var inspected = 0
+        return containsVisibleToolbar(window, depth: 0, inspected: &inspected)
+    }
+
+    private static func accessibilityBounds(of window: AXUIElement) -> CGRect? {
+        var positionValue: CFTypeRef?
+        var sizeValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &positionValue) == .success,
+              AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeValue) == .success,
+              let positionValue, let sizeValue,
+              CFGetTypeID(positionValue) == AXValueGetTypeID(),
+              CFGetTypeID(sizeValue) == AXValueGetTypeID() else { return nil }
+
+        var origin = CGPoint.zero
+        var size = CGSize.zero
+        let position = unsafeBitCast(positionValue, to: AXValue.self)
+        let dimensions = unsafeBitCast(sizeValue, to: AXValue.self)
+        guard AXValueGetValue(position, .cgPoint, &origin),
+              AXValueGetValue(dimensions, .cgSize, &size) else { return nil }
+        return CGRect(origin: origin, size: size)
+    }
+
+    private static func approximatelyEqual(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
+        abs(lhs.minX - rhs.minX) <= 12 &&
+            abs(lhs.minY - rhs.minY) <= 12 &&
+            abs(lhs.width - rhs.width) <= 16 &&
+            abs(lhs.height - rhs.height) <= 16
+    }
+
+    private static func containsVisibleToolbar(
+        _ element: AXUIElement,
+        depth: Int,
+        inspected: inout Int
+    ) -> Bool {
+        guard depth <= 5, inspected < 160 else { return false }
+        inspected += 1
+
+        var roleValue: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleValue) == .success,
+           let role = roleValue as? String,
+           role == (kAXToolbarRole as String) {
+            var hiddenValue: CFTypeRef?
+            let hiddenResult = AXUIElementCopyAttributeValue(
+                element,
+                kAXHiddenAttribute as CFString,
+                &hiddenValue
+            )
+            return hiddenResult != .success || (hiddenValue as? Bool) != true
+        }
+
+        var childrenValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element,
+            kAXChildrenAttribute as CFString,
+            &childrenValue
+        ) == .success,
+        let children = childrenValue as? [AXUIElement] else { return false }
+
+        for child in children {
+            if containsVisibleToolbar(child, depth: depth + 1, inspected: &inspected) { return true }
+        }
+        return false
+    }
+}
+
+private final class OverlayPanel: NSPanel, NSWindowDelegate {
+    static let defaultSize = NSSize(width: 176, height: 82)
+    static let minimumSize = NSSize(width: 154, height: 76)
     static let maximumSize = NSSize(width: 420, height: 260)
 
     private let statusLabel = NSTextField(labelWithString: "正在检查任务状态")
     private let dot = NSTextField(labelWithString: "●")
     private let periodLabel = NSTextField(labelWithString: "周用量")
+    private let nextRefreshLabel = NSTextField(labelWithString: "刷新 --")
     private let percentageLabel = NSTextField(labelWithString: "--")
     private let resetCountLabel = NSTextField(labelWithString: "重置 --")
     private let resetExpiryLabel = NSTextField(labelWithString: "--")
     private let connectionLabel = NSTextField(labelWithString: "正在连接 Codex")
     private let progress = NSProgressIndicator()
     private weak var appDelegate: AppDelegate?
+    private var baseFonts: [ObjectIdentifier: (label: NSTextField, size: CGFloat, weight: NSFont.Weight)] = [:]
+    private var isUserResizing = false
+    private var isCorrectingSize = false
 
     init(delegate: AppDelegate) {
         self.appDelegate = delegate
-        super.init(contentRect: Self.initialFrame(), styleMask: [.borderless, .nonactivatingPanel, .resizable], backing: .buffered, defer: false)
+        // 仅使用自定义右下角缩放柄。borderless + 系统 resizable 在屏幕唤醒时可能被 AppKit 横向拉伸。
+        super.init(contentRect: Self.initialFrame(), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         minSize = Self.minimumSize
         maxSize = Self.maximumSize
+        self.delegate = self
         isFloatingPanel = true
         level = .floating
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
@@ -144,12 +446,13 @@ private final class OverlayPanel: NSPanel {
         hasShadow = true
         hidesOnDeactivate = false
         setupContent()
+        updateTypography()
     }
 
     private static func initialFrame() -> NSRect {
         let defaults = UserDefaults.standard
         var size = defaultSize
-        if let value = defaults.string(forKey: "panelSizeV2") {
+        if let value = defaults.string(forKey: "panelSizeV4") {
             let saved = NSSizeFromString(value)
             if saved.width >= minimumSize.width, saved.height >= minimumSize.height,
                saved.width <= maximumSize.width, saved.height <= maximumSize.height {
@@ -160,11 +463,20 @@ private final class OverlayPanel: NSPanel {
             let point = NSPointFromString(value)
             let savedFrame = NSRect(origin: point, size: size)
             if NSScreen.screens.contains(where: { $0.visibleFrame.intersects(savedFrame) }) {
-                return savedFrame
+                return constrainedToVisibleScreen(savedFrame)
             }
         }
         let screen = NSScreen.main?.visibleFrame ?? .zero
         return NSRect(x: screen.maxX - size.width - 28, y: screen.maxY - size.height - 48, width: size.width, height: size.height)
+    }
+
+    private static func constrainedToVisibleScreen(_ candidate: NSRect) -> NSRect {
+        let screen = NSScreen.screens.first(where: { $0.visibleFrame.intersects(candidate) }) ?? NSScreen.main
+        guard let visible = screen?.visibleFrame else { return candidate }
+        var result = candidate
+        result.origin.x = min(max(result.minX, visible.minX), visible.maxX - result.width)
+        result.origin.y = min(max(result.minY, visible.minY), visible.maxY - result.height)
+        return result
     }
 
     private func setupContent() {
@@ -172,8 +484,7 @@ private final class OverlayPanel: NSPanel {
         let container = NSView(frame: contentView?.bounds ?? .zero)
         container.autoresizingMask = [.width, .height]
         container.wantsLayer = true
-        container.layer?.cornerRadius = 14
-        container.layer?.masksToBounds = true
+        container.layer?.cornerRadius = 0
         container.layer?.backgroundColor = background.cgColor
         contentView = container
 
@@ -185,20 +496,31 @@ private final class OverlayPanel: NSPanel {
             body.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
             body.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
             body.topAnchor.constraint(equalTo: container.topAnchor, constant: 5),
-            body.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor, constant: -5)
+            body.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor, constant: -2)
         ])
 
         let statusRow = NSStackView(views: [dot, statusLabel])
         statusRow.spacing = 5
-        style(dot, color: amber, size: 8, bold: true)
-        style(statusLabel, color: foreground, size: 10, bold: true)
+        style(dot, color: amber, size: 10, bold: true)
+        style(statusLabel, color: foreground, size: 13, bold: true)
         body.addArrangedSubview(statusRow)
 
         let usageRow = NSStackView()
-        usageRow.orientation = .horizontal; usageRow.distribution = .fillEqually
-        style(periodLabel, color: muted, size: 9, bold: false)
-        style(percentageLabel, color: foreground, size: 9, bold: true); percentageLabel.alignment = .right
-        usageRow.addArrangedSubview(periodLabel); usageRow.addArrangedSubview(percentageLabel)
+        usageRow.orientation = .horizontal; usageRow.distribution = .fill; usageRow.spacing = 4
+        style(periodLabel, color: muted, size: 11, bold: false)
+        style(nextRefreshLabel, color: muted, size: 10, bold: false)
+        style(percentageLabel, color: foreground, size: 11, bold: true); percentageLabel.alignment = .right
+        periodLabel.setContentHuggingPriority(.required, for: .horizontal)
+        periodLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        nextRefreshLabel.alignment = .right
+        nextRefreshLabel.lineBreakMode = .byTruncatingTail
+        nextRefreshLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        nextRefreshLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        percentageLabel.setContentHuggingPriority(.required, for: .horizontal)
+        percentageLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        usageRow.addArrangedSubview(periodLabel)
+        usageRow.addArrangedSubview(nextRefreshLabel)
+        usageRow.addArrangedSubview(percentageLabel)
         body.addArrangedSubview(usageRow)
         usageRow.widthAnchor.constraint(equalTo: body.widthAnchor).isActive = true
 
@@ -210,13 +532,13 @@ private final class OverlayPanel: NSPanel {
 
         let resetRow = NSStackView()
         resetRow.orientation = .horizontal; resetRow.distribution = .fillEqually
-        style(resetCountLabel, color: muted, size: 9, bold: false)
-        style(resetExpiryLabel, color: muted, size: 8, bold: false); resetExpiryLabel.alignment = .right
+        style(resetCountLabel, color: muted, size: 11, bold: false)
+        style(resetExpiryLabel, color: muted, size: 10, bold: false); resetExpiryLabel.alignment = .right
         resetRow.addArrangedSubview(resetCountLabel); resetRow.addArrangedSubview(resetExpiryLabel)
         body.addArrangedSubview(resetRow)
         resetRow.widthAnchor.constraint(equalTo: body.widthAnchor).isActive = true
 
-        style(connectionLabel, color: muted, size: 8, bold: false)
+        style(connectionLabel, color: muted, size: 10, bold: false)
         connectionLabel.lineBreakMode = .byTruncatingTail
         body.addArrangedSubview(connectionLabel)
         connectionLabel.widthAnchor.constraint(equalTo: body.widthAnchor).isActive = true
@@ -242,12 +564,60 @@ private final class OverlayPanel: NSPanel {
         menu.items.forEach { $0.target = appDelegate }
         NSMenu.popUpContextMenu(menu, with: event, for: contentView ?? NSView())
     }
-    override func resignKey() { saveFrame() }
+    func windowDidResize(_ notification: Notification) {
+        updateTypography()
+        // 只有右下角缩放柄产生的尺寸变化才算用户操作。系统在切换 Space、
+        // 全屏或唤醒屏幕时偶尔会拉伸 borderless panel，下一轮主线程立即纠正。
+        if !isUserResizing && !isCorrectingSize {
+            DispatchQueue.main.async { [weak self] in
+                self?.restoreSavedSizeIfNeeded()
+            }
+        }
+    }
 
     private func savePosition() { saveFrame() }
     fileprivate func saveFrame() {
         UserDefaults.standard.set(NSStringFromPoint(frame.origin), forKey: "panelOrigin")
-        UserDefaults.standard.set(NSStringFromSize(frame.size), forKey: "panelSizeV2")
+        UserDefaults.standard.set(NSStringFromSize(frame.size), forKey: "panelSizeV4")
+    }
+
+    fileprivate func beginUserResize() { isUserResizing = true }
+    fileprivate func endUserResize() {
+        isUserResizing = false
+        saveFrame()
+    }
+
+    fileprivate func restoreSavedSizeIfNeeded(force: Bool = false) {
+        guard !isUserResizing, !isCorrectingSize,
+              let value = UserDefaults.standard.string(forKey: "panelSizeV4") else {
+            if !isUserResizing, !isCorrectingSize {
+                UserDefaults.standard.set(NSStringFromSize(Self.defaultSize), forKey: "panelSizeV4")
+            }
+            return
+        }
+        let saved = NSSizeFromString(value)
+        guard saved.width >= Self.minimumSize.width, saved.height >= Self.minimumSize.height,
+              saved.width <= Self.maximumSize.width, saved.height <= Self.maximumSize.height else {
+            UserDefaults.standard.set(NSStringFromSize(Self.defaultSize), forKey: "panelSizeV4")
+            restore(size: Self.defaultSize)
+            return
+        }
+        let differs = abs(frame.width - saved.width) > 1 || abs(frame.height - saved.height) > 1
+        guard force || differs else { return }
+
+        restore(size: saved)
+    }
+
+    private func restore(size saved: NSSize) {
+        isCorrectingSize = true
+        var corrected = frame
+        let top = corrected.maxY
+        corrected.size = saved
+        corrected.origin.y = top - saved.height
+        corrected = Self.constrainedToVisibleScreen(corrected)
+        setFrame(corrected, display: true)
+        isCorrectingSize = false
+        updateTypography()
     }
 
     func setActivity(_ snapshot: ActivitySnapshot) {
@@ -256,6 +626,8 @@ private final class OverlayPanel: NSPanel {
     }
     func setUsage(_ snapshot: UsageSnapshot) {
         periodLabel.stringValue = snapshot.period
+        nextRefreshLabel.stringValue = snapshot.nextRefreshText
+        nextRefreshLabel.toolTip = snapshot.nextRefreshTooltip
         percentageLabel.stringValue = "\(Int(snapshot.usedPercent.rounded()))%"
         progress.doubleValue = snapshot.usedPercent
     }
@@ -270,7 +642,19 @@ private final class OverlayPanel: NSPanel {
     }
     func setConnection(_ text: String) { connectionLabel.stringValue = text }
     private func style(_ label: NSTextField, color: NSColor, size: CGFloat, bold: Bool) {
-        label.textColor = color; label.font = .systemFont(ofSize: size, weight: bold ? .semibold : .regular)
+        let weight: NSFont.Weight = bold ? .semibold : .regular
+        label.textColor = color
+        label.font = .systemFont(ofSize: size, weight: weight)
+        baseFonts[ObjectIdentifier(label)] = (label, size, weight)
+    }
+
+    fileprivate func updateTypography() {
+        let widthRatio = frame.width / Self.defaultSize.width
+        let heightRatio = frame.height / Self.defaultSize.height
+        let scale = min(1.8, max(0.82, min(widthRatio, heightRatio)))
+        for entry in baseFonts.values {
+            entry.label.font = .systemFont(ofSize: entry.size * scale, weight: entry.weight)
+        }
     }
 }
 
@@ -298,6 +682,7 @@ private final class ResizeHandleView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         guard let panel else { return }
+        panel.beginUserResize()
         startFrame = panel.frame
         startPoint = NSEvent.mouseLocation
     }
@@ -311,12 +696,45 @@ private final class ResizeHandleView: NSView {
         let height = min(OverlayPanel.maximumSize.height, max(OverlayPanel.minimumSize.height, startFrame.height - dy))
         let bottom = startFrame.maxY - height
         panel.setFrame(NSRect(x: startFrame.minX, y: bottom, width: width, height: height), display: true)
+        panel.updateTypography()
     }
 
-    override func mouseUp(with event: NSEvent) { panel?.saveFrame() }
+    override func mouseUp(with event: NSEvent) { panel?.endUserResize() }
 }
 
-private struct UsageSnapshot { let usedPercent: Double; let period: String }
+private struct UsageSnapshot {
+    let usedPercent: Double
+    let period: String
+    let resetsAt: Date?
+
+    var nextRefreshText: String {
+        guard let resetsAt else { return "刷新 --" }
+        return "刷新 \(Self.shortDateFormatter.string(from: resetsAt))"
+    }
+
+    var nextRefreshTooltip: String {
+        guard let resetsAt else { return "Codex 未返回下次用量刷新时间" }
+        return "下次用量刷新：\(Self.fullDateFormatter.string(from: resetsAt)) +8"
+    }
+
+    private static let shortDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.timeZone = TimeZone(secondsFromGMT: 8 * 3600)
+        formatter.dateFormat = "M/d HH:mm"
+        return formatter
+    }()
+
+    private static let fullDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.timeZone = TimeZone(secondsFromGMT: 8 * 3600)
+        formatter.dateFormat = "yyyy/M/d HH:mm"
+        return formatter
+    }()
+}
 
 private struct ResetCreditsSnapshot {
     let availableCount: Int
@@ -488,7 +906,24 @@ private final class CodexUsageClient {
         else if let minutes, minutes % 1440 == 0 { period = "\(minutes / 1440)天用量" }
         else if let minutes, minutes % 60 == 0 { period = "\(minutes / 60)小时用量" }
         else { period = "\(minutes!)分钟用量" }
-        return UsageSnapshot(usedPercent: min(100, max(0, used)), period: period)
+        let resetValue = primary["resetsAt"] ?? primary["resets_at"]
+        return UsageSnapshot(
+            usedPercent: min(100, max(0, used)),
+            period: period,
+            resetsAt: Self.parseResetDate(resetValue)
+        )
+    }
+
+    private static func parseResetDate(_ value: Any?) -> Date? {
+        let raw: Double?
+        if let number = value as? NSNumber { raw = number.doubleValue }
+        else if let text = value as? String { raw = Double(text) }
+        else { raw = nil }
+        guard let raw, raw.isFinite, raw > 0 else { return nil }
+
+        // Codex 通常返回 Unix 秒；仍兼容少数客户端/网关传回的毫秒级时间戳。
+        let seconds = raw >= 10_000_000_000 ? raw / 1_000 : raw
+        return Date(timeIntervalSince1970: seconds)
     }
     private func findCodex() -> URL? {
         let manager = FileManager.default

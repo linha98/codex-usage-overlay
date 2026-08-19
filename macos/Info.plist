@@ -12,4 +12,5 @@
   <key>CFBundleVersion</key><string>1</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSAccessibilityUsageDescription</key><string>用于判断浏览器工具栏是否隐藏，从而在全屏视频时自动隐藏悬浮窗。</string>
 </dict></plist>
