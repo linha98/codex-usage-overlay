@@ -16,8 +16,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var usageClient = CodexUsageClient()
     private var resetClient = ResetCreditsClient()
+    private let sessionMonitor = SessionMonitor()
+    private let fullscreenQueue = DispatchQueue(label: "CodexOverlay.fullscreen", qos: .utility)
     private var refreshTimer: Timer?
     private var fullscreenTimer: Timer?
+    private var fullscreenCheckInFlight = false
     private var usage = 0.0
     private var activity = ActivitySnapshot.idle
     private var isClickThrough = false
@@ -100,6 +103,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func performRefresh(forceReset: Bool) {
         panel.restoreSavedSizeIfNeeded()
         panel.setConnection("正在读取 Codex 用量…")
+        sessionMonitor.scan { [weak self] snapshot in
+            guard let self else { return }
+            self.activity = snapshot
+            self.panel.setActivity(snapshot)
+            self.updateMenuTitle()
+        }
         usageClient.refresh { [weak self] result in
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -111,8 +120,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 case .failure(let error):
                     self.panel.setConnection(error.localizedDescription)
                 }
-                self.activity = SessionMonitor().scan()
-                self.panel.setActivity(self.activity)
                 self.updateMenuTitle()
             }
         }
@@ -167,9 +174,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func updateFullscreenVisibility() {
         guard autoHideInFullscreen else { return }
-        let state = FullscreenDetector.inspectFrontmostApp(
+        guard !fullscreenCheckInFlight else { return }
+        guard let context = FullscreenDetector.captureFrontmostApp(
             excludingPID: ProcessInfo.processInfo.processIdentifier
-        )
+        ) else {
+            applyFullscreenVisibility(.none)
+            return
+        }
+        fullscreenCheckInFlight = true
+        fullscreenQueue.async { [weak self] in
+            let state = FullscreenDetector.inspect(context)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.fullscreenCheckInFlight = false
+                guard self.autoHideInFullscreen else { return }
+                self.applyFullscreenVisibility(state)
+            }
+        }
+    }
+
+    private func applyFullscreenVisibility(_ state: FullscreenDetector.State) {
         let fullscreen = state.coversDisplay || state.likelyWebVideoFullscreen
         if fullscreen {
             automaticallyHidden = true
@@ -217,6 +241,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 }
 
 private enum FullscreenDetector {
+    struct ScreenRegion {
+        let display: CGRect
+        let visible: CGRect
+    }
+
+    struct Context {
+        let pid: pid_t
+        let bundleIdentifier: String?
+        let screenRegions: [ScreenRegion]
+    }
+
     struct State {
         let pid: pid_t?
         let coversDisplay: Bool
@@ -225,19 +260,14 @@ private enum FullscreenDetector {
         static let none = State(pid: nil, coversDisplay: false, coversVisibleArea: false, likelyWebVideoFullscreen: false)
     }
 
-    static func inspectFrontmostApp(excludingPID: pid_t) -> State {
-        guard let application = NSWorkspace.shared.frontmostApplication else { return .none }
+    // AppKit 的前台应用和屏幕坐标需从主线程读取；之后的窗口列举和辅助功能查询
+    // 会由专用后台队列处理，避免拖动、悬停等界面事件被阻塞。
+    static func captureFrontmostApp(excludingPID: pid_t) -> Context? {
+        guard let application = NSWorkspace.shared.frontmostApplication else { return nil }
         let pid = application.processIdentifier
-        guard pid != excludingPID else { return .none }
+        guard pid != excludingPID else { return nil }
 
-        guard let rawWindows = CGWindowListCopyWindowInfo(
-            [.optionOnScreenOnly, .excludeDesktopElements],
-            kCGNullWindowID
-        ) as? [[String: Any]] else {
-            return State(pid: pid, coversDisplay: false, coversVisibleArea: false, likelyWebVideoFullscreen: false)
-        }
-
-        let screenRegions = NSScreen.screens.compactMap { screen -> (display: CGRect, visible: CGRect)? in
+        let screenRegions = NSScreen.screens.compactMap { screen -> ScreenRegion? in
             let key = NSDeviceDescriptionKey("NSScreenNumber")
             guard let number = screen.deviceDescription[key] as? NSNumber else { return nil }
             let display = CGDisplayBounds(CGDirectDisplayID(number.uint32Value))
@@ -249,20 +279,30 @@ private enum FullscreenDetector {
                 width: visible.width,
                 height: visible.height
             )
-            return (display, visibleInQuartz)
+            return ScreenRegion(display: display, visible: visibleInQuartz)
+        }
+        return Context(pid: pid, bundleIdentifier: application.bundleIdentifier, screenRegions: screenRegions)
+    }
+
+    static func inspect(_ context: Context) -> State {
+        guard let rawWindows = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return State(pid: context.pid, coversDisplay: false, coversVisibleArea: false, likelyWebVideoFullscreen: false)
         }
 
         var coversDisplay = false
         var visibleAreaWindows: [CGRect] = []
         for window in rawWindows {
-            guard (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid,
+            guard (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == context.pid,
                   (window[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
                   ((window[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1) > 0.05,
                   let boundsDictionary = window[kCGWindowBounds as String] as? [String: Any],
                   let bounds = CGRect(dictionaryRepresentation: boundsDictionary as CFDictionary),
                   bounds.width > 0, bounds.height > 0 else { continue }
 
-            for region in screenRegions {
+            for region in context.screenRegions {
                 if coversRegion(window: bounds, region: region.display, tolerance: 0.985) {
                     coversDisplay = true
                 }
@@ -277,15 +317,15 @@ private enum FullscreenDetector {
             "com.operasoftware.Opera", "com.apple.QuickTimePlayerX",
             "org.videolan.vlc", "com.colliderli.iina"
         ]
-        let isMediaApplication = mediaBundles.contains(application.bundleIdentifier ?? "")
+        let isMediaApplication = mediaBundles.contains(context.bundleIdentifier ?? "")
         let coversVisibleArea = !visibleAreaWindows.isEmpty
         let toolbarVisibility = isMediaApplication
-            ? browserToolbarIsVisible(pid: pid, matching: visibleAreaWindows)
+            ? browserToolbarIsVisible(pid: context.pid, matching: visibleAreaWindows)
             : nil
         // 网页全屏与普通最大化可能拥有完全相同的窗口尺寸；未获辅助功能权限时不做猜测。
         let likelyWebVideoFullscreen = coversVisibleArea && isMediaApplication && toolbarVisibility == false
         return State(
-            pid: pid,
+            pid: context.pid,
             coversDisplay: coversDisplay,
             coversVisibleArea: coversVisibleArea,
             likelyWebVideoFullscreen: likelyWebVideoFullscreen
@@ -958,39 +998,87 @@ private struct ActivitySnapshot {
     static let idle = ActivitySnapshot(status: .unknown, title: "正在检查任务状态")
 }
 
-private struct SessionMonitor {
-    func scan() -> ActivitySnapshot {
-        let root = ProcessInfo.processInfo.environment["CODEX_HOME"].map(URL.init(fileURLWithPath:)) ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
+private final class SessionMonitor {
+    private static let maximumSessions = 60
+    // 只需找出最后一条任务生命周期事件；读取文件尾部足以避免每分钟重读数百 MB 的历史会话。
+    // 某些任务事件会落在超长 JSONL 记录中；1 MB 可覆盖该情况，且每轮最多读取 60 MB。
+    private static let tailByteLimit = 1024 * 1024
+
+    private let queue = DispatchQueue(label: "CodexOverlay.sessionMonitor", qos: .utility)
+    private var isScanning = false
+
+    func scan(completion: @escaping (ActivitySnapshot) -> Void) {
+        // 所有调用来自 AppKit 主线程。进行中的扫描不再排队，保留最近一次已知状态即可。
+        guard !isScanning else { return }
+        isScanning = true
+        queue.async { [weak self] in
+            let snapshot = Self.scanSessions()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isScanning = false
+                completion(snapshot)
+            }
+        }
+    }
+
+    private static func scanSessions() -> ActivitySnapshot {
+        let root = ProcessInfo.processInfo.environment["CODEX_HOME"].map(URL.init(fileURLWithPath:))
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
         let sessions = root.appendingPathComponent("sessions")
-        guard let enumerator = FileManager.default.enumerator(at: sessions, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]) else { return ActivitySnapshot(status: .unknown, title: "未找到 Codex 会话") }
-        let paths = (enumerator.allObjects as? [URL] ?? []).filter { $0.pathExtension == "jsonl" }
-        let latest = paths.sorted {
-            let left = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            let right = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            return left > right
-        }.prefix(60)
+        guard let enumerator = FileManager.default.enumerator(
+            at: sessions,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return ActivitySnapshot(status: .unknown, title: "未找到 Codex 会话")
+        }
+
+        var sessionFiles: [(url: URL, modified: Date)] = []
+        while let path = enumerator.nextObject() as? URL {
+            guard path.pathExtension == "jsonl" else { continue }
+            let modified = (try? path.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+                ?? .distantPast
+            sessionFiles.append((url: path, modified: modified))
+        }
+
+        let latest = sessionFiles.sorted { $0.modified > $1.modified }.prefix(maximumSessions)
         var active = 0
         var stale = 0
         let now = Date()
-        for path in latest where path.pathExtension == "jsonl" {
-            guard let data = try? Data(contentsOf: path), let text = String(data: data, encoding: .utf8) else { continue }
-            var lastLifecycle: String?
-            for line in text.split(separator: "\n") {
-                guard let lineData = line.data(using: .utf8),
-                      let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                      object["type"] as? String == "event_msg",
-                      let payload = object["payload"] as? [String: Any],
-                      let type = payload["type"] as? String,
-                      ["task_started", "task_complete", "turn_aborted"].contains(type) else { continue }
-                lastLifecycle = type
-            }
-            guard lastLifecycle == "task_started" else { continue }
-            let modified = (try? path.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            if now.timeIntervalSince(modified) <= 12 * 3600 { active += 1 } else { stale += 1 }
+        for session in latest {
+            guard lastLifecycleEvent(in: session.url) == "task_started" else { continue }
+            if now.timeIntervalSince(session.modified) <= 12 * 3600 { active += 1 }
+            else { stale += 1 }
         }
-        if active > 0 { return ActivitySnapshot(status: .running, title: active == 1 ? "执行中" : "执行中 × \(active)") }
+
+        if active > 0 {
+            return ActivitySnapshot(status: .running, title: active == 1 ? "执行中" : "执行中 × \(active)")
+        }
         if stale > 0 { return ActivitySnapshot(status: .unknown, title: "状态未知") }
         return ActivitySnapshot(status: .idle, title: "空闲")
+    }
+
+    private static func lastLifecycleEvent(in path: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: path) else { return nil }
+        defer { try? handle.close() }
+
+        guard let fileSize = try? handle.seekToEnd() else { return nil }
+        let offset = fileSize > UInt64(tailByteLimit) ? fileSize - UInt64(tailByteLimit) : 0
+        guard (try? handle.seek(toOffset: offset)) != nil,
+              let data = try? handle.readToEnd(),
+              let text = String(data: data, encoding: .utf8) else { return nil }
+
+        // 倒序读取，找到最新事件就结束，避免对尾部所有 JSON 再做无意义解析。
+        for line in text.split(separator: "\n").reversed() {
+            guard let lineData = line.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                  object["type"] as? String == "event_msg",
+                  let payload = object["payload"] as? [String: Any],
+                  let type = payload["type"] as? String,
+                  ["task_started", "task_complete", "turn_aborted"].contains(type) else { continue }
+            return type
+        }
+        return nil
     }
 }
 
