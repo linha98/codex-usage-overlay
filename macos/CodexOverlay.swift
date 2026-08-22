@@ -456,6 +456,9 @@ private final class OverlayPanel: NSPanel, NSWindowDelegate {
     static let defaultSize = NSSize(width: 176, height: 82)
     static let minimumSize = NSSize(width: 154, height: 76)
     static let maximumSize = NSSize(width: 420, height: 260)
+    // V4 曾在系统自动拉伸窗口后被普通拖动写入异常尺寸；V5 只记录缩放柄的有效尺寸。
+    private static let sizePreferenceKey = "panelSizeV5"
+    private static let legacySizePreferenceKey = "panelSizeV4"
 
     private let statusLabel = NSTextField(labelWithString: "正在检查任务状态")
     private let dot = NSTextField(labelWithString: "●")
@@ -491,14 +494,7 @@ private final class OverlayPanel: NSPanel, NSWindowDelegate {
 
     private static func initialFrame() -> NSRect {
         let defaults = UserDefaults.standard
-        var size = defaultSize
-        if let value = defaults.string(forKey: "panelSizeV4") {
-            let saved = NSSizeFromString(value)
-            if saved.width >= minimumSize.width, saved.height >= minimumSize.height,
-               saved.width <= maximumSize.width, saved.height <= maximumSize.height {
-                size = saved
-            }
-        }
+        let size = savedSize(defaults: defaults) ?? defaultSize
         if let value = defaults.string(forKey: "panelOrigin") {
             let point = NSPointFromString(value)
             let savedFrame = NSRect(origin: point, size: size)
@@ -508,6 +504,28 @@ private final class OverlayPanel: NSPanel, NSWindowDelegate {
         }
         let screen = NSScreen.main?.visibleFrame ?? .zero
         return NSRect(x: screen.maxX - size.width - 28, y: screen.maxY - size.height - 48, width: size.width, height: size.height)
+    }
+
+    private static func isValidSize(_ size: NSSize) -> Bool {
+        size.width >= minimumSize.width && size.height >= minimumSize.height &&
+            size.width <= maximumSize.width && size.height <= maximumSize.height
+    }
+
+    private static func savedSize(defaults: UserDefaults) -> NSSize? {
+        if let value = defaults.string(forKey: sizePreferenceKey) {
+            let size = NSSizeFromString(value)
+            if isValidSize(size) { return size }
+        }
+
+        // 保留此前用户正常调整过的尺寸，但丢弃类似 541 × 82 的异常 V4 记录。
+        if let value = defaults.string(forKey: legacySizePreferenceKey) {
+            let size = NSSizeFromString(value)
+            if isValidSize(size) {
+                defaults.set(NSStringFromSize(size), forKey: sizePreferenceKey)
+                return size
+            }
+        }
+        return nil
     }
 
     private static func constrainedToVisibleScreen(_ candidate: NSRect) -> NSRect {
@@ -615,33 +633,25 @@ private final class OverlayPanel: NSPanel, NSWindowDelegate {
         }
     }
 
-    private func savePosition() { saveFrame() }
-    fileprivate func saveFrame() {
+    private func savePosition() {
         UserDefaults.standard.set(NSStringFromPoint(frame.origin), forKey: "panelOrigin")
-        UserDefaults.standard.set(NSStringFromSize(frame.size), forKey: "panelSizeV4")
     }
 
     fileprivate func beginUserResize() { isUserResizing = true }
     fileprivate func endUserResize() {
         isUserResizing = false
-        saveFrame()
-    }
-
-    fileprivate func restoreSavedSizeIfNeeded(force: Bool = false) {
-        guard !isUserResizing, !isCorrectingSize,
-              let value = UserDefaults.standard.string(forKey: "panelSizeV4") else {
-            if !isUserResizing, !isCorrectingSize {
-                UserDefaults.standard.set(NSStringFromSize(Self.defaultSize), forKey: "panelSizeV4")
-            }
-            return
-        }
-        let saved = NSSizeFromString(value)
-        guard saved.width >= Self.minimumSize.width, saved.height >= Self.minimumSize.height,
-              saved.width <= Self.maximumSize.width, saved.height <= Self.maximumSize.height else {
-            UserDefaults.standard.set(NSStringFromSize(Self.defaultSize), forKey: "panelSizeV4")
+        let size = frame.size
+        guard Self.isValidSize(size) else {
             restore(size: Self.defaultSize)
             return
         }
+        UserDefaults.standard.set(NSStringFromSize(size), forKey: Self.sizePreferenceKey)
+        savePosition()
+    }
+
+    fileprivate func restoreSavedSizeIfNeeded(force: Bool = false) {
+        guard !isUserResizing, !isCorrectingSize else { return }
+        let saved = Self.savedSize(defaults: .standard) ?? Self.defaultSize
         let differs = abs(frame.width - saved.width) > 1 || abs(frame.height - saved.height) > 1
         guard force || differs else { return }
 
