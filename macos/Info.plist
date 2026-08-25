@@ -5,6 +5,7 @@
   <key>CFBundleDisplayName</key><string>Codex 悬浮窗</string>
   <key>CFBundleExecutable</key><string>CodexOverlay</string>
   <key>CFBundleIdentifier</key><string>com.local.codex-usage-overlay</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>Codex 悬浮窗</string>
   <key>CFBundlePackageType</key><string>APPL</string>
