@@ -905,34 +905,60 @@ private final class ResetCreditsClient {
     private let queue = DispatchQueue(label: "CodexOverlay.resetCredits")
     private var cached: ResetCreditsSnapshot?
     private var lastAttempt: Date?
+    private var lastSuccess: Date?
 
     func refresh(force: Bool, completion: @escaping (Result<ResetCreditsSnapshot, Error>) -> Void) {
         queue.async {
+            if !force, let cached = self.cached, let lastSuccess = self.lastSuccess,
+               Date().timeIntervalSince(lastSuccess) < 3600 {
+                completion(.success(cached))
+                return
+            }
+            // 读取失败后一分钟重试，避免一次短暂故障让“重置 --”停留整整一小时。
             if !force, let lastAttempt = self.lastAttempt,
-               Date().timeIntervalSince(lastAttempt) < 3600 {
-                if let cached = self.cached { completion(.success(cached)) }
-                else { completion(.failure(OverlayError.invalidResetResponse)) }
+               Date().timeIntervalSince(lastAttempt) < 60 {
+                self.completeWithCacheOrError(OverlayError.invalidResetResponse, completion: completion)
                 return
             }
             do {
                 self.lastAttempt = Date()
                 let request = try self.makeRequest()
                 URLSession.shared.dataTask(with: request) { data, response, error in
-                    if let error { completion(.failure(error)); return }
-                    if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-                        completion(.failure(OverlayError.server("重置次数服务返回 \(http.statusCode)"))); return
+                    if let error {
+                        self.queue.async { self.completeWithCacheOrError(error, completion: completion) }
+                        return
                     }
-                    guard let data else { completion(.failure(OverlayError.invalidResetResponse)); return }
+                    if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                        self.queue.async {
+                            self.completeWithCacheOrError(OverlayError.server("重置次数服务返回 \(http.statusCode)"), completion: completion)
+                        }
+                        return
+                    }
+                    guard let data else {
+                        self.queue.async { self.completeWithCacheOrError(OverlayError.invalidResetResponse, completion: completion) }
+                        return
+                    }
                     do {
                         let snapshot = try Self.parse(data)
                         self.queue.async {
                             self.cached = snapshot
+                            self.lastSuccess = Date()
                             completion(.success(snapshot))
                         }
-                    } catch { completion(.failure(error)) }
+                    } catch {
+                        self.queue.async { self.completeWithCacheOrError(error, completion: completion) }
+                    }
                 }.resume()
-            } catch { completion(.failure(error)) }
+            } catch { self.completeWithCacheOrError(error, completion: completion) }
         }
+    }
+
+    private func completeWithCacheOrError(
+        _ error: Error,
+        completion: @escaping (Result<ResetCreditsSnapshot, Error>) -> Void
+    ) {
+        if let cached { completion(.success(cached)) }
+        else { completion(.failure(error)) }
     }
 
     private func makeRequest() throws -> URLRequest {
@@ -1111,6 +1137,7 @@ private final class CodexUsageClient {
         let manager = FileManager.default
         let candidates = [
             ProcessInfo.processInfo.environment["CODEX_EXE"],
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
             "/Applications/ChatGPT.app/Contents/Resources/codex",
             "/Applications/Codex.app/Contents/Resources/codex",
             "/opt/homebrew/bin/codex", "/usr/local/bin/codex"
