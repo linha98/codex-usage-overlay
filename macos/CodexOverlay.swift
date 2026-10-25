@@ -21,7 +21,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var refreshTimer: Timer?
     private var fullscreenTimer: Timer?
     private var fullscreenCheckInFlight = false
-    private var usage = 0.0
+    private var fullscreenExitSince: Date?
+    private var usageSummary = "用量 --"
     private var activity = ActivitySnapshot.idle
     private var isClickThrough = false
     private var manuallyHidden = false
@@ -44,9 +45,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.performRefresh(forceReset: false)
         }
-        fullscreenTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+        fullscreenTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             self?.updateFullscreenVisibility()
         }
+        fullscreenTimer?.tolerance = 0.3
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(handleFrontmostAppChange),
+            name: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(handleFrontmostAppChange),
+            name: NSWorkspace.didActivateApplicationNotification,
+            object: nil
+        )
         NSWorkspace.shared.notificationCenter.addObserver(
             self,
             selector: #selector(handleSystemWake),
@@ -114,7 +128,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard let self else { return }
                 switch result {
                 case .success(let snapshot):
-                    self.usage = snapshot.usedPercent
+                    self.usageSummary = snapshot.menuText
                     self.panel.setUsage(snapshot)
                     self.panel.setConnection("已连接 Codex")
                 case .failure(let error):
@@ -178,7 +192,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let context = FullscreenDetector.captureFrontmostApp(
             excludingPID: ProcessInfo.processInfo.processIdentifier
         ) else {
-            applyFullscreenVisibility(.none)
+            // 菜单、悬浮窗短暂成为前台时，保留上一状态，避免全屏中闪现。
             return
         }
         fullscreenCheckInFlight = true
@@ -188,7 +202,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard let self else { return }
                 self.fullscreenCheckInFlight = false
                 guard self.autoHideInFullscreen else { return }
+                guard NSWorkspace.shared.frontmostApplication?.processIdentifier == context.pid else { return }
                 self.applyFullscreenVisibility(state)
+                if ProcessInfo.processInfo.environment["CODEX_OVERLAY_FULLSCREEN_DIAGNOSTICS"] == "1" {
+                    print("fullscreen-check pid=\(context.pid) trusted=\(AXIsProcessTrusted()) full=\(state.coversDisplay) ax=\(String(describing: state.explicitFullscreen)) web=\(state.likelyWebVideoFullscreen) uncertain=\(state.uncertain) hidden=\(self.automaticallyHidden) visible=\(self.panel.isVisible)")
+                    fflush(stdout)
+                }
             }
         }
     }
@@ -196,11 +215,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func applyFullscreenVisibility(_ state: FullscreenDetector.State) {
         let fullscreen = state.coversDisplay || state.likelyWebVideoFullscreen
         if fullscreen {
+            fullscreenExitSince = nil
             automaticallyHidden = true
             if panel.isVisible {
                 panel.orderOut(nil)
             }
         } else if automaticallyHidden {
+            guard !state.uncertain else { fullscreenExitSince = nil; return }
+            // Space/播放器切换动画中的短暂普通尺寸不能作为退出依据。
+            guard let since = fullscreenExitSince else { fullscreenExitSince = Date(); return }
+            guard Date().timeIntervalSince(since) >= 1 else { return }
+            fullscreenExitSince = nil
             automaticallyHidden = false
             if !manuallyHidden { panel.orderFrontRegardless() }
         }
@@ -231,8 +256,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    @objc private func handleFrontmostAppChange() {
+        updateFullscreenVisibility()
+    }
+
     private func updateMenuTitle() {
-        statusItem.button?.toolTip = "Codex \(activity.title) · 用量 \(Int(usage.rounded()))%"
+        statusItem.button?.toolTip = "Codex \(activity.title) · \(usageSummary)"
     }
 
     private func showError(_ text: String) {
@@ -257,6 +286,8 @@ private enum FullscreenDetector {
         let coversDisplay: Bool
         let coversVisibleArea: Bool
         let likelyWebVideoFullscreen: Bool
+        var uncertain = false
+        var explicitFullscreen: Bool?
         static let none = State(pid: nil, coversDisplay: false, coversVisibleArea: false, likelyWebVideoFullscreen: false)
     }
 
@@ -285,6 +316,8 @@ private enum FullscreenDetector {
     }
 
     static func inspect(_ context: Context) -> State {
+        let deadline = Date().addingTimeInterval(0.7)
+        let explicitFullscreen = windowFullscreenState(pid: context.pid, deadline: deadline)
         guard let rawWindows = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements],
             kCGNullWindowID
@@ -296,7 +329,8 @@ private enum FullscreenDetector {
         var visibleAreaWindows: [CGRect] = []
         for window in rawWindows {
             guard (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == context.pid,
-                  (window[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+                  // Chrome 的独立视频全屏窗口可能位于非零层。
+                  ((window[kCGWindowLayer as String] as? NSNumber)?.intValue ?? 0) < 100,
                   ((window[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1) > 0.05,
                   let boundsDictionary = window[kCGWindowBounds as String] as? [String: Any],
                   let bounds = CGRect(dictionaryRepresentation: boundsDictionary as CFDictionary),
@@ -319,17 +353,34 @@ private enum FullscreenDetector {
         ]
         let isMediaApplication = mediaBundles.contains(context.bundleIdentifier ?? "")
         let coversVisibleArea = !visibleAreaWindows.isEmpty
-        let toolbarVisibility = isMediaApplication
-            ? browserToolbarIsVisible(pid: context.pid, matching: visibleAreaWindows)
+        let toolbarVisibility = isMediaApplication && coversVisibleArea && explicitFullscreen == nil
+            ? browserToolbarIsVisible(pid: context.pid, matching: visibleAreaWindows, deadline: deadline)
             : nil
         // 网页全屏与普通最大化可能拥有完全相同的窗口尺寸；未获辅助功能权限时不做猜测。
         let likelyWebVideoFullscreen = coversVisibleArea && isMediaApplication && toolbarVisibility == false
-        return State(
+        var state = State(
             pid: context.pid,
-            coversDisplay: coversDisplay,
+            coversDisplay: coversDisplay || explicitFullscreen == true,
             coversVisibleArea: coversVisibleArea,
             likelyWebVideoFullscreen: likelyWebVideoFullscreen
         )
+        state.uncertain = explicitFullscreen == nil && !state.coversDisplay && coversVisibleArea && isMediaApplication && toolbarVisibility == nil
+        state.explicitFullscreen = explicitFullscreen
+        return state
+    }
+
+    private static func windowFullscreenState(pid: pid_t, deadline: Date) -> Bool? {
+        guard AXIsProcessTrusted() else { return nil }
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.08)
+        var focused: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &focused) == .success,
+              let focused, Date() < deadline else { return nil }
+        let window = unsafeBitCast(focused, to: AXUIElement.self)
+        AXUIElementSetMessagingTimeout(window, 0.08)
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, "AXFullScreen" as CFString, &value) == .success else { return nil }
+        return value as? Bool
     }
 
     private static func coversRegion(window: CGRect, region: CGRect, tolerance: CGFloat) -> Bool {
@@ -352,9 +403,10 @@ private enum FullscreenDetector {
         AXIsProcessTrustedWithOptions([promptKey: true] as CFDictionary)
     }
 
-    private static func browserToolbarIsVisible(pid: pid_t, matching candidates: [CGRect]) -> Bool? {
-        guard AXIsProcessTrusted() else { return nil }
+    private static func browserToolbarIsVisible(pid: pid_t, matching candidates: [CGRect], deadline: Date) -> Bool? {
+        guard AXIsProcessTrusted(), !candidates.isEmpty, Date() < deadline else { return nil }
         let application = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(application, 0.08)
 
         // Chrome 可能同时有多个窗口；必须检查与 CGWindow 全屏候选尺寸相符的窗口，
         // 不能只读 focusedWindow（切换 Space 或播放器全屏时它可能仍指向另一个普通窗口）。
@@ -366,13 +418,17 @@ private enum FullscreenDetector {
         ) == .success,
         let windows = windowsValue as? [AXUIElement] {
             let matchingWindows = windows.filter { window in
+                guard Date() < deadline else { return false }
+                AXUIElementSetMessagingTimeout(window, 0.08)
                 guard let bounds = accessibilityBounds(of: window) else { return false }
                 return candidates.contains { approximatelyEqual(bounds, $0) }
             }
             if !matchingWindows.isEmpty {
                 for window in matchingWindows {
                     var inspected = 0
-                    if containsVisibleToolbar(window, depth: 0, inspected: &inspected) { return true }
+                    if let visible = containsVisibleToolbar(window, depth: 0, inspected: &inspected, deadline: deadline) {
+                        if visible { return true }
+                    } else { return nil }
                 }
                 return false
             }
@@ -387,8 +443,9 @@ private enum FullscreenDetector {
         )
         guard focusedResult == .success, let focusedValue else { return nil }
         let window = unsafeBitCast(focusedValue, to: AXUIElement.self)
+        guard let bounds = accessibilityBounds(of: window), candidates.contains(where: { approximatelyEqual(bounds, $0) }) else { return nil }
         var inspected = 0
-        return containsVisibleToolbar(window, depth: 0, inspected: &inspected)
+        return containsVisibleToolbar(window, depth: 0, inspected: &inspected, deadline: deadline)
     }
 
     private static func accessibilityBounds(of window: AXUIElement) -> CGRect? {
@@ -419,10 +476,13 @@ private enum FullscreenDetector {
     private static func containsVisibleToolbar(
         _ element: AXUIElement,
         depth: Int,
-        inspected: inout Int
-    ) -> Bool {
-        guard depth <= 5, inspected < 160 else { return false }
+        inspected: inout Int,
+        deadline: Date
+    ) -> Bool? {
+        guard Date() < deadline, inspected < 80 else { return nil }
+        guard depth <= 5 else { return false }
         inspected += 1
+        AXUIElementSetMessagingTimeout(element, 0.08)
 
         var roleValue: CFTypeRef?
         if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleValue) == .success,
@@ -434,38 +494,53 @@ private enum FullscreenDetector {
                 kAXHiddenAttribute as CFString,
                 &hiddenValue
             )
-            return hiddenResult != .success || (hiddenValue as? Bool) != true
+            if hiddenResult == .success, (hiddenValue as? Bool) == true { return false }
+            // 隐藏属性在 Chrome 上经常不受支持，改用实际几何尺寸。
+            guard let bounds = accessibilityBounds(of: element) else { return nil }
+            return bounds.width > 1 && bounds.height > 1
         }
+
+        if roleValue as? String == "AXWebArea" { return false }
 
         var childrenValue: CFTypeRef?
         guard AXUIElementCopyAttributeValue(
             element,
             kAXChildrenAttribute as CFString,
             &childrenValue
-        ) == .success,
-        let children = childrenValue as? [AXUIElement] else { return false }
+        ) == .success else { return nil }
+        guard let children = childrenValue as? [AXUIElement] else { return false }
 
+        var incomplete = false
         for child in children {
-            if containsVisibleToolbar(child, depth: depth + 1, inspected: &inspected) { return true }
+            if let visible = containsVisibleToolbar(child, depth: depth + 1, inspected: &inspected, deadline: deadline) {
+                if visible { return true }
+            } else { incomplete = true }
         }
-        return false
+        return incomplete ? nil : false
     }
 }
 
 private final class OverlayPanel: NSPanel, NSWindowDelegate {
-    static let defaultSize = NSSize(width: 176, height: 82)
-    static let minimumSize = NSSize(width: 154, height: 76)
+    static let defaultSize = NSSize(width: 176, height: 104)
+    static let minimumSize = NSSize(width: 154, height: 96)
     static let maximumSize = NSSize(width: 420, height: 260)
+    // V4 曾在系统自动拉伸窗口后被普通拖动写入异常尺寸；V6 为双用量行预留足够高度。
+    private static let sizePreferenceKey = "panelSizeV6"
+    private static let legacySizePreferenceKeys = ["panelSizeV5", "panelSizeV4"]
 
     private let statusLabel = NSTextField(labelWithString: "正在检查任务状态")
     private let dot = NSTextField(labelWithString: "●")
-    private let periodLabel = NSTextField(labelWithString: "周用量")
-    private let nextRefreshLabel = NSTextField(labelWithString: "刷新 --")
-    private let percentageLabel = NSTextField(labelWithString: "--")
+    private let shortPeriodLabel = NSTextField(labelWithString: "5小时用量")
+    private let shortNextRefreshLabel = NSTextField(labelWithString: "刷新 --")
+    private let shortPercentageLabel = NSTextField(labelWithString: "--")
+    private let weeklyPeriodLabel = NSTextField(labelWithString: "周用量")
+    private let weeklyNextRefreshLabel = NSTextField(labelWithString: "刷新 --")
+    private let weeklyPercentageLabel = NSTextField(labelWithString: "--")
     private let resetCountLabel = NSTextField(labelWithString: "重置 --")
     private let resetExpiryLabel = NSTextField(labelWithString: "--")
     private let connectionLabel = NSTextField(labelWithString: "正在连接 Codex")
-    private let progress = NSProgressIndicator()
+    private let shortProgress = NSProgressIndicator()
+    private let weeklyProgress = NSProgressIndicator()
     private weak var appDelegate: AppDelegate?
     private var baseFonts: [ObjectIdentifier: (label: NSTextField, size: CGFloat, weight: NSFont.Weight)] = [:]
     private var isUserResizing = false
@@ -491,14 +566,7 @@ private final class OverlayPanel: NSPanel, NSWindowDelegate {
 
     private static func initialFrame() -> NSRect {
         let defaults = UserDefaults.standard
-        var size = defaultSize
-        if let value = defaults.string(forKey: "panelSizeV4") {
-            let saved = NSSizeFromString(value)
-            if saved.width >= minimumSize.width, saved.height >= minimumSize.height,
-               saved.width <= maximumSize.width, saved.height <= maximumSize.height {
-                size = saved
-            }
-        }
+        let size = savedSize(defaults: defaults) ?? defaultSize
         if let value = defaults.string(forKey: "panelOrigin") {
             let point = NSPointFromString(value)
             let savedFrame = NSRect(origin: point, size: size)
@@ -508,6 +576,30 @@ private final class OverlayPanel: NSPanel, NSWindowDelegate {
         }
         let screen = NSScreen.main?.visibleFrame ?? .zero
         return NSRect(x: screen.maxX - size.width - 28, y: screen.maxY - size.height - 48, width: size.width, height: size.height)
+    }
+
+    private static func isValidSize(_ size: NSSize) -> Bool {
+        size.width >= minimumSize.width && size.height >= minimumSize.height &&
+            size.width <= maximumSize.width && size.height <= maximumSize.height
+    }
+
+    private static func savedSize(defaults: UserDefaults) -> NSSize? {
+        if let value = defaults.string(forKey: sizePreferenceKey) {
+            let size = NSSizeFromString(value)
+            if isValidSize(size) { return size }
+        }
+
+        // 保留此前用户正常调整过的尺寸，但丢弃类似 541 × 82 的异常 V4 记录。
+        for key in legacySizePreferenceKeys {
+            if let value = defaults.string(forKey: key) {
+                let size = NSSizeFromString(value)
+                if isValidSize(size) {
+                    defaults.set(NSStringFromSize(size), forKey: sizePreferenceKey)
+                    return size
+                }
+            }
+        }
+        return nil
     }
 
     private static func constrainedToVisibleScreen(_ candidate: NSRect) -> NSRect {
@@ -545,30 +637,27 @@ private final class OverlayPanel: NSPanel, NSWindowDelegate {
         style(statusLabel, color: foreground, size: 13, bold: true)
         body.addArrangedSubview(statusRow)
 
-        let usageRow = NSStackView()
-        usageRow.orientation = .horizontal; usageRow.distribution = .fill; usageRow.spacing = 4
-        style(periodLabel, color: muted, size: 11, bold: false)
-        style(nextRefreshLabel, color: muted, size: 10, bold: false)
-        style(percentageLabel, color: foreground, size: 11, bold: true); percentageLabel.alignment = .right
-        periodLabel.setContentHuggingPriority(.required, for: .horizontal)
-        periodLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
-        nextRefreshLabel.alignment = .right
-        nextRefreshLabel.lineBreakMode = .byTruncatingTail
-        nextRefreshLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        nextRefreshLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        percentageLabel.setContentHuggingPriority(.required, for: .horizontal)
-        percentageLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
-        usageRow.addArrangedSubview(periodLabel)
-        usageRow.addArrangedSubview(nextRefreshLabel)
-        usageRow.addArrangedSubview(percentageLabel)
-        body.addArrangedSubview(usageRow)
-        usageRow.widthAnchor.constraint(equalTo: body.widthAnchor).isActive = true
+        let shortUsageRow = makeUsageRow(
+            period: shortPeriodLabel,
+            refresh: shortNextRefreshLabel,
+            percentage: shortPercentageLabel
+        )
+        body.addArrangedSubview(shortUsageRow)
+        shortUsageRow.widthAnchor.constraint(equalTo: body.widthAnchor).isActive = true
+        configureProgress(shortProgress)
+        body.addArrangedSubview(shortProgress)
+        shortProgress.widthAnchor.constraint(equalTo: body.widthAnchor).isActive = true
 
-        progress.isIndeterminate = false; progress.minValue = 0; progress.maxValue = 100; progress.doubleValue = 0
-        progress.style = .bar; progress.translatesAutoresizingMaskIntoConstraints = false
-        progress.heightAnchor.constraint(equalToConstant: 2).isActive = true
-        body.addArrangedSubview(progress)
-        progress.widthAnchor.constraint(equalTo: body.widthAnchor).isActive = true
+        let weeklyUsageRow = makeUsageRow(
+            period: weeklyPeriodLabel,
+            refresh: weeklyNextRefreshLabel,
+            percentage: weeklyPercentageLabel
+        )
+        body.addArrangedSubview(weeklyUsageRow)
+        weeklyUsageRow.widthAnchor.constraint(equalTo: body.widthAnchor).isActive = true
+        configureProgress(weeklyProgress)
+        body.addArrangedSubview(weeklyProgress)
+        weeklyProgress.widthAnchor.constraint(equalTo: body.widthAnchor).isActive = true
 
         let resetRow = NSStackView()
         resetRow.orientation = .horizontal; resetRow.distribution = .fillEqually
@@ -580,6 +669,10 @@ private final class OverlayPanel: NSPanel, NSWindowDelegate {
 
         style(connectionLabel, color: muted, size: 10, bold: false)
         connectionLabel.lineBreakMode = .byTruncatingTail
+        connectionLabel.maximumNumberOfLines = 1
+        connectionLabel.cell?.usesSingleLineMode = true
+        connectionLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        connectionLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         body.addArrangedSubview(connectionLabel)
         connectionLabel.widthAnchor.constraint(equalTo: body.widthAnchor).isActive = true
 
@@ -615,33 +708,25 @@ private final class OverlayPanel: NSPanel, NSWindowDelegate {
         }
     }
 
-    private func savePosition() { saveFrame() }
-    fileprivate func saveFrame() {
+    private func savePosition() {
         UserDefaults.standard.set(NSStringFromPoint(frame.origin), forKey: "panelOrigin")
-        UserDefaults.standard.set(NSStringFromSize(frame.size), forKey: "panelSizeV4")
     }
 
     fileprivate func beginUserResize() { isUserResizing = true }
     fileprivate func endUserResize() {
         isUserResizing = false
-        saveFrame()
-    }
-
-    fileprivate func restoreSavedSizeIfNeeded(force: Bool = false) {
-        guard !isUserResizing, !isCorrectingSize,
-              let value = UserDefaults.standard.string(forKey: "panelSizeV4") else {
-            if !isUserResizing, !isCorrectingSize {
-                UserDefaults.standard.set(NSStringFromSize(Self.defaultSize), forKey: "panelSizeV4")
-            }
-            return
-        }
-        let saved = NSSizeFromString(value)
-        guard saved.width >= Self.minimumSize.width, saved.height >= Self.minimumSize.height,
-              saved.width <= Self.maximumSize.width, saved.height <= Self.maximumSize.height else {
-            UserDefaults.standard.set(NSStringFromSize(Self.defaultSize), forKey: "panelSizeV4")
+        let size = frame.size
+        guard Self.isValidSize(size) else {
             restore(size: Self.defaultSize)
             return
         }
+        UserDefaults.standard.set(NSStringFromSize(size), forKey: Self.sizePreferenceKey)
+        savePosition()
+    }
+
+    fileprivate func restoreSavedSizeIfNeeded(force: Bool = false) {
+        guard !isUserResizing, !isCorrectingSize else { return }
+        let saved = Self.savedSize(defaults: .standard) ?? Self.defaultSize
         let differs = abs(frame.width - saved.width) > 1 || abs(frame.height - saved.height) > 1
         guard force || differs else { return }
 
@@ -665,11 +750,20 @@ private final class OverlayPanel: NSPanel, NSWindowDelegate {
         dot.textColor = snapshot.status == .running ? green : (snapshot.status == .idle ? blue : amber)
     }
     func setUsage(_ snapshot: UsageSnapshot) {
-        periodLabel.stringValue = snapshot.period
-        nextRefreshLabel.stringValue = snapshot.nextRefreshText
-        nextRefreshLabel.toolTip = snapshot.nextRefreshTooltip
-        percentageLabel.stringValue = "\(Int(snapshot.usedPercent.rounded()))%"
-        progress.doubleValue = snapshot.usedPercent
+        setUsageWindow(
+            snapshot.shortWindow,
+            periodLabel: shortPeriodLabel,
+            refreshLabel: shortNextRefreshLabel,
+            percentageLabel: shortPercentageLabel,
+            progress: shortProgress
+        )
+        setUsageWindow(
+            snapshot.weeklyWindow,
+            periodLabel: weeklyPeriodLabel,
+            refreshLabel: weeklyNextRefreshLabel,
+            percentageLabel: weeklyPercentageLabel,
+            progress: weeklyProgress
+        )
     }
     func setReset(_ snapshot: ResetCreditsSnapshot?) {
         guard let snapshot else {
@@ -680,7 +774,55 @@ private final class OverlayPanel: NSPanel, NSWindowDelegate {
         resetCountLabel.stringValue = "重置 \(snapshot.availableCount)次"
         resetExpiryLabel.stringValue = snapshot.nearestExpiryText
     }
-    func setConnection(_ text: String) { connectionLabel.stringValue = text }
+    func setConnection(_ text: String) {
+        connectionLabel.stringValue = text.count > 36 ? "Codex 用量读取失败" : text
+        connectionLabel.toolTip = text
+        // 长错误消息可能在本轮 Auto Layout 中短暂改变 panel 的 fitting size；
+        // 文案更新完成后再次锁回用户保存的有效尺寸。
+        DispatchQueue.main.async { [weak self] in
+            self?.restoreSavedSizeIfNeeded(force: true)
+        }
+    }
+
+    private func makeUsageRow(period: NSTextField, refresh: NSTextField, percentage: NSTextField) -> NSStackView {
+        let row = NSStackView()
+        row.orientation = .horizontal; row.distribution = .fill; row.spacing = 4
+        style(period, color: muted, size: 11, bold: false)
+        style(refresh, color: muted, size: 10, bold: false)
+        style(percentage, color: foreground, size: 11, bold: true); percentage.alignment = .right
+        period.setContentHuggingPriority(.required, for: .horizontal)
+        period.setContentCompressionResistancePriority(.required, for: .horizontal)
+        refresh.alignment = .right
+        refresh.lineBreakMode = .byTruncatingTail
+        refresh.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        refresh.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        percentage.setContentHuggingPriority(.required, for: .horizontal)
+        percentage.setContentCompressionResistancePriority(.required, for: .horizontal)
+        row.addArrangedSubview(period)
+        row.addArrangedSubview(refresh)
+        row.addArrangedSubview(percentage)
+        return row
+    }
+
+    private func configureProgress(_ progress: NSProgressIndicator) {
+        progress.isIndeterminate = false; progress.minValue = 0; progress.maxValue = 100; progress.doubleValue = 0
+        progress.style = .bar; progress.translatesAutoresizingMaskIntoConstraints = false
+        progress.heightAnchor.constraint(equalToConstant: 2).isActive = true
+    }
+
+    private func setUsageWindow(
+        _ window: UsageWindowSnapshot,
+        periodLabel: NSTextField,
+        refreshLabel: NSTextField,
+        percentageLabel: NSTextField,
+        progress: NSProgressIndicator
+    ) {
+        periodLabel.stringValue = window.period
+        refreshLabel.stringValue = window.nextRefreshText
+        refreshLabel.toolTip = window.nextRefreshTooltip
+        percentageLabel.stringValue = window.percentageText
+        progress.doubleValue = window.usedPercent ?? 0
+    }
     private func style(_ label: NSTextField, color: NSColor, size: CGFloat, bold: Bool) {
         let weight: NSFont.Weight = bold ? .semibold : .regular
         label.textColor = color
@@ -742,20 +884,47 @@ private final class ResizeHandleView: NSView {
     override func mouseUp(with event: NSEvent) { panel?.endUserResize() }
 }
 
-private struct UsageSnapshot {
-    let usedPercent: Double
+private struct UsageWindowSnapshot {
+    let usedPercent: Double?
     let period: String
     let resetsAt: Date?
+    let windowDurationMins: Int?
+
+    static func unavailable(period: String, windowDurationMins: Int?) -> UsageWindowSnapshot {
+        UsageWindowSnapshot(
+            usedPercent: nil,
+            period: period,
+            resetsAt: nil,
+            windowDurationMins: windowDurationMins
+        )
+    }
+
+    var percentageText: String {
+        guard let usedPercent else { return "--" }
+        return "\(Int(usedPercent.rounded()))%"
+    }
 
     var nextRefreshText: String {
         guard let resetsAt else { return "刷新 --" }
-        return "刷新 \(Self.shortDateFormatter.string(from: resetsAt))"
+        let formatter = (windowDurationMins ?? 0) <= 24 * 60
+            ? Self.hourFormatter
+            : Self.shortDateFormatter
+        return "刷新 \(formatter.string(from: resetsAt))"
     }
 
     var nextRefreshTooltip: String {
         guard let resetsAt else { return "Codex 未返回下次用量刷新时间" }
         return "下次用量刷新：\(Self.fullDateFormatter.string(from: resetsAt)) +8"
     }
+
+    private static let hourFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.timeZone = TimeZone(secondsFromGMT: 8 * 3600)
+        formatter.dateFormat = "HH:mm"
+        return formatter
+    }()
 
     private static let shortDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -774,6 +943,15 @@ private struct UsageSnapshot {
         formatter.dateFormat = "yyyy/M/d HH:mm"
         return formatter
     }()
+}
+
+private struct UsageSnapshot {
+    let shortWindow: UsageWindowSnapshot
+    let weeklyWindow: UsageWindowSnapshot
+
+    var menuText: String {
+        "\(shortWindow.period) \(shortWindow.percentageText) · \(weeklyWindow.period) \(weeklyWindow.percentageText)"
+    }
 }
 
 private struct ResetCreditsSnapshot {
@@ -795,34 +973,60 @@ private final class ResetCreditsClient {
     private let queue = DispatchQueue(label: "CodexOverlay.resetCredits")
     private var cached: ResetCreditsSnapshot?
     private var lastAttempt: Date?
+    private var lastSuccess: Date?
 
     func refresh(force: Bool, completion: @escaping (Result<ResetCreditsSnapshot, Error>) -> Void) {
         queue.async {
+            if !force, let cached = self.cached, let lastSuccess = self.lastSuccess,
+               Date().timeIntervalSince(lastSuccess) < 3600 {
+                completion(.success(cached))
+                return
+            }
+            // 读取失败后一分钟重试，避免一次短暂故障让“重置 --”停留整整一小时。
             if !force, let lastAttempt = self.lastAttempt,
-               Date().timeIntervalSince(lastAttempt) < 3600 {
-                if let cached = self.cached { completion(.success(cached)) }
-                else { completion(.failure(OverlayError.invalidResetResponse)) }
+               Date().timeIntervalSince(lastAttempt) < 60 {
+                self.completeWithCacheOrError(OverlayError.invalidResetResponse, completion: completion)
                 return
             }
             do {
                 self.lastAttempt = Date()
                 let request = try self.makeRequest()
                 URLSession.shared.dataTask(with: request) { data, response, error in
-                    if let error { completion(.failure(error)); return }
-                    if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-                        completion(.failure(OverlayError.server("重置次数服务返回 \(http.statusCode)"))); return
+                    if let error {
+                        self.queue.async { self.completeWithCacheOrError(error, completion: completion) }
+                        return
                     }
-                    guard let data else { completion(.failure(OverlayError.invalidResetResponse)); return }
+                    if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                        self.queue.async {
+                            self.completeWithCacheOrError(OverlayError.server("重置次数服务返回 \(http.statusCode)"), completion: completion)
+                        }
+                        return
+                    }
+                    guard let data else {
+                        self.queue.async { self.completeWithCacheOrError(OverlayError.invalidResetResponse, completion: completion) }
+                        return
+                    }
                     do {
                         let snapshot = try Self.parse(data)
                         self.queue.async {
                             self.cached = snapshot
+                            self.lastSuccess = Date()
                             completion(.success(snapshot))
                         }
-                    } catch { completion(.failure(error)) }
+                    } catch {
+                        self.queue.async { self.completeWithCacheOrError(error, completion: completion) }
+                    }
                 }.resume()
-            } catch { completion(.failure(error)) }
+            } catch { self.completeWithCacheOrError(error, completion: completion) }
         }
+    }
+
+    private func completeWithCacheOrError(
+        _ error: Error,
+        completion: @escaping (Result<ResetCreditsSnapshot, Error>) -> Void
+    ) {
+        if let cached { completion(.success(cached)) }
+        else { completion(.failure(error)) }
     }
 
     private func makeRequest() throws -> URLRequest {
@@ -868,30 +1072,110 @@ private final class CodexUsageClient {
     private var buffer = Data()
     private var nextId = 1
     private var pending: [Int: (Result<[String: Any], Error>) -> Void] = [:]
+    private var refreshCompletions: [(Result<UsageSnapshot, Error>) -> Void] = []
+    private var nextFallbackAt = Date.distantPast
     private let queue = DispatchQueue(label: "CodexOverlay.appServer")
 
     func refresh(completion: @escaping (Result<UsageSnapshot, Error>) -> Void) {
         queue.async {
-            self.ensureServer { result in
-                switch result {
-                case .failure(let error): completion(.failure(error))
-                case .success: self.request("account/rateLimits/read", params: [:]) { response in
-                    completion(response.flatMap { result in
+            self.refreshCompletions.append(completion)
+            guard self.refreshCompletions.count == 1 else { return }
+            self.refreshDirectly()
+        }
+    }
+
+    private func refreshDirectly() {
+        do {
+            let request = try makeUsageRequest()
+            URLSession.shared.dataTask(with: request) { data, response, error in
+                self.queue.async {
+                    if error == nil,
+                       let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+                       let data,
+                       let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let snapshot = Self.parseDirectUsage(object) {
+                        self.nextFallbackAt = .distantPast
+                        self.finishRefresh(.success(snapshot))
+                    } else {
+                        // 令牌过期、接口暂时不可用或响应格式变化时，让 Codex 自己读取并刷新登录状态。
+                        self.refreshThroughCodexIfDue()
+                    }
+                }
+            }.resume()
+        } catch {
+            refreshThroughCodexIfDue()
+        }
+    }
+
+    private func refreshThroughCodexIfDue() {
+        guard Date() >= nextFallbackAt else {
+            finishRefresh(.failure(OverlayError.invalidResponse))
+            return
+        }
+        // 连续故障时限制启动 CLI 的次数；直接接口仍照常每分钟尝试。
+        nextFallbackAt = Date().addingTimeInterval(5 * 60)
+        refreshThroughCodex()
+    }
+
+    private func makeUsageRequest() throws -> URLRequest {
+        let root = ProcessInfo.processInfo.environment["CODEX_HOME"].map(URL.init(fileURLWithPath:))
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
+        let data = try Data(contentsOf: root.appendingPathComponent("auth.json"))
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tokens = object["tokens"] as? [String: Any],
+              let token = tokens["access_token"] as? String, !token.isEmpty else {
+            throw OverlayError.noCredentials
+        }
+        var request = URLRequest(url: URL(string: "https://chatgpt.com/backend-api/wham/usage")!)
+        request.timeoutInterval = 15
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("https://chatgpt.com", forHTTPHeaderField: "Origin")
+        request.setValue("https://chatgpt.com/", forHTTPHeaderField: "Referer")
+        return request
+    }
+
+    private func refreshThroughCodex() {
+        ensureServer { result in
+            switch result {
+            case .failure(let error): self.finishRefresh(.failure(error))
+            case .success:
+                self.request("account/rateLimits/read", params: [:]) { response in
+                    self.finishRefresh(response.flatMap { result in
                         guard let snapshot = Self.parseUsage(result) else {
                             return .failure(OverlayError.invalidResponse)
                         }
                         return .success(snapshot)
                     })
                 }
-                }
             }
         }
     }
 
-    func stop() { queue.async { self.process?.terminate(); self.process = nil } }
+    private func finishRefresh(_ result: Result<UsageSnapshot, Error>) {
+        stopServer()
+        let completions = refreshCompletions
+        refreshCompletions.removeAll()
+        for completion in completions { completion(result) }
+    }
+
+    func stop() { queue.async { self.stopServer() } }
+
+    private func stopServer() {
+        output?.readabilityHandler = nil
+        try? input?.close()
+        try? output?.close()
+        if process?.isRunning == true { process?.terminate() }
+        process = nil
+        input = nil
+        output = nil
+        buffer.removeAll(keepingCapacity: true)
+    }
 
     private func ensureServer(completion: @escaping (Result<Void, Error>) -> Void) {
         if process?.isRunning == true { completion(.success(())); return }
+        stopServer()
         guard let executable = findCodex() else { completion(.failure(OverlayError.noCodex)); return }
         let task = Process(); task.executableURL = executable; task.arguments = ["app-server", "--listen", "stdio://"]
         let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
@@ -936,21 +1220,81 @@ private final class CodexUsageClient {
     }
     private static func parseUsage(_ result: [String: Any]) -> UsageSnapshot? {
         let limits = result["rateLimits"] as? [String: Any] ?? result
-        let primary = limits["primary"] as? [String: Any] ?? limits["limit"] as? [String: Any]
-        guard let primary else { return nil }
-        let used = (primary["usedPercent"] as? NSNumber)?.doubleValue ?? (primary["used_percent"] as? NSNumber)?.doubleValue
+        var windows = ["primary", "secondary"].compactMap { key in
+            parseUsageWindow(limits[key] as? [String: Any])
+        }
+        if windows.isEmpty, let legacy = parseUsageWindow(limits["limit"] as? [String: Any]) {
+            windows = [legacy]
+        }
+        guard !windows.isEmpty else { return nil }
+
+        windows.sort { left, right in
+            (left.windowDurationMins ?? Int.max) < (right.windowDurationMins ?? Int.max)
+        }
+
+        if windows.count == 1, let only = windows.first {
+            if (only.windowDurationMins ?? 0) >= 7 * 24 * 60 {
+                return UsageSnapshot(
+                    shortWindow: .unavailable(period: "5小时用量", windowDurationMins: 5 * 60),
+                    weeklyWindow: only
+                )
+            }
+            return UsageSnapshot(
+                shortWindow: only,
+                weeklyWindow: .unavailable(period: "周用量", windowDurationMins: 7 * 24 * 60)
+            )
+        }
+
+        return UsageSnapshot(shortWindow: windows[0], weeklyWindow: windows[windows.count - 1])
+    }
+
+    private static func parseDirectUsage(_ result: [String: Any]) -> UsageSnapshot? {
+        guard let limit = result["rate_limit"] as? [String: Any] else { return nil }
+        let windows = ["primary_window", "secondary_window"].compactMap { key -> UsageWindowSnapshot? in
+            guard let window = limit[key] as? [String: Any],
+                  let used = window["used_percent"],
+                  let seconds = window["limit_window_seconds"] as? NSNumber else { return nil }
+            return parseUsageWindow([
+                "usedPercent": used,
+                "windowDurationMins": seconds.intValue / 60,
+                "resetsAt": window["reset_at"] ?? NSNull()
+            ])
+        }
+        guard let first = windows.first else { return nil }
+        if windows.count == 1 {
+            if (first.windowDurationMins ?? 0) >= 7 * 24 * 60 {
+                return UsageSnapshot(
+                    shortWindow: .unavailable(period: "5小时用量", windowDurationMins: 5 * 60),
+                    weeklyWindow: first
+                )
+            }
+            return UsageSnapshot(
+                shortWindow: first,
+                weeklyWindow: .unavailable(period: "周用量", windowDurationMins: 7 * 24 * 60)
+            )
+        }
+        return UsageSnapshot(shortWindow: windows[0], weeklyWindow: windows[1])
+    }
+
+    private static func parseUsageWindow(_ limit: [String: Any]?) -> UsageWindowSnapshot? {
+        guard let limit else { return nil }
+        let used = (limit["usedPercent"] as? NSNumber)?.doubleValue ?? (limit["used_percent"] as? NSNumber)?.doubleValue
         guard let used else { return nil }
-        let minutes = (primary["windowDurationMins"] as? NSNumber)?.intValue ?? (primary["window_duration_mins"] as? NSNumber)?.intValue
+        let minutes = (limit["windowDurationMins"] as? NSNumber)?.intValue
+            ?? (limit["window_duration_mins"] as? NSNumber)?.intValue
         let period: String
-        if minutes == nil || minutes == 10080 { period = "周用量" }
+        if minutes == 300 { period = "5小时用量" }
+        else if minutes == nil { period = "用量" }
+        else if minutes == 10080 { period = "周用量" }
         else if let minutes, minutes % 1440 == 0 { period = "\(minutes / 1440)天用量" }
         else if let minutes, minutes % 60 == 0 { period = "\(minutes / 60)小时用量" }
         else { period = "\(minutes!)分钟用量" }
-        let resetValue = primary["resetsAt"] ?? primary["resets_at"]
-        return UsageSnapshot(
+        let resetValue = limit["resetsAt"] ?? limit["resets_at"]
+        return UsageWindowSnapshot(
             usedPercent: min(100, max(0, used)),
             period: period,
-            resetsAt: Self.parseResetDate(resetValue)
+            resetsAt: Self.parseResetDate(resetValue),
+            windowDurationMins: minutes
         )
     }
 
@@ -969,11 +1313,25 @@ private final class CodexUsageClient {
         let manager = FileManager.default
         let candidates = [
             ProcessInfo.processInfo.environment["CODEX_EXE"],
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
             "/Applications/ChatGPT.app/Contents/Resources/codex",
             "/Applications/Codex.app/Contents/Resources/codex",
             "/opt/homebrew/bin/codex", "/usr/local/bin/codex"
         ].compactMap { $0 }
-        return candidates.first(where: { manager.isExecutableFile(atPath: $0) }).map(URL.init(fileURLWithPath:))
+        if let path = candidates.first(where: { manager.isExecutableFile(atPath: $0) }) {
+            return URL(fileURLWithPath: path)
+        }
+        // 应用更新可能移动内置 CLI；仅在直接接口失败时扫描应用资源目录。
+        for app in ["/Applications/ChatGPT.app", "/Applications/Codex.app"] {
+            let resources = URL(fileURLWithPath: app).appendingPathComponent("Contents/Resources")
+            guard let files = manager.enumerator(at: resources, includingPropertiesForKeys: nil) else { continue }
+            while let file = files.nextObject() as? URL {
+                if file.lastPathComponent == "codex", manager.isExecutableFile(atPath: file.path) {
+                    return file
+                }
+            }
+        }
+        return nil
     }
 }
 
@@ -1006,47 +1364,59 @@ private final class SessionMonitor {
 
     private let queue = DispatchQueue(label: "CodexOverlay.sessionMonitor", qos: .utility)
     private var isScanning = false
+    private var eventCache: [URL: (modified: Date, size: Int, event: String?)] = [:]
 
     func scan(completion: @escaping (ActivitySnapshot) -> Void) {
         // 所有调用来自 AppKit 主线程。进行中的扫描不再排队，保留最近一次已知状态即可。
         guard !isScanning else { return }
         isScanning = true
         queue.async { [weak self] in
-            let snapshot = Self.scanSessions()
+            guard let self else { return }
+            let snapshot = self.scanSessions()
             DispatchQueue.main.async {
-                guard let self else { return }
                 self.isScanning = false
                 completion(snapshot)
             }
         }
     }
 
-    private static func scanSessions() -> ActivitySnapshot {
+    private func scanSessions() -> ActivitySnapshot {
         let root = ProcessInfo.processInfo.environment["CODEX_HOME"].map(URL.init(fileURLWithPath:))
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
         let sessions = root.appendingPathComponent("sessions")
         guard let enumerator = FileManager.default.enumerator(
             at: sessions,
-            includingPropertiesForKeys: [.contentModificationDateKey],
+            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
             options: [.skipsHiddenFiles]
         ) else {
             return ActivitySnapshot(status: .unknown, title: "未找到 Codex 会话")
         }
 
-        var sessionFiles: [(url: URL, modified: Date)] = []
+        var sessionFiles: [(url: URL, modified: Date, size: Int)] = []
         while let path = enumerator.nextObject() as? URL {
             guard path.pathExtension == "jsonl" else { continue }
-            let modified = (try? path.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
-                ?? .distantPast
-            sessionFiles.append((url: path, modified: modified))
+            let values = try? path.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+            sessionFiles.append((url: path,
+                                 modified: values?.contentModificationDate ?? .distantPast,
+                                 size: values?.fileSize ?? 0))
         }
 
-        let latest = sessionFiles.sorted { $0.modified > $1.modified }.prefix(maximumSessions)
+        let latest = sessionFiles.sorted { $0.modified > $1.modified }.prefix(Self.maximumSessions)
+        let retainedURLs = Set(latest.map { $0.url })
+        eventCache = eventCache.filter { retainedURLs.contains($0.key) }
         var active = 0
         var stale = 0
         let now = Date()
         for session in latest {
-            guard lastLifecycleEvent(in: session.url) == "task_started" else { continue }
+            let event: String?
+            if let cached = eventCache[session.url],
+               cached.modified == session.modified, cached.size == session.size {
+                event = cached.event
+            } else {
+                event = Self.lastLifecycleEvent(in: session.url)
+                eventCache[session.url] = (session.modified, session.size, event)
+            }
+            guard event == "task_started" else { continue }
             if now.timeIntervalSince(session.modified) <= 12 * 3600 { active += 1 }
             else { stale += 1 }
         }
