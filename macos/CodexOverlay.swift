@@ -19,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let sessionMonitor = SessionMonitor()
     private let fullscreenQueue = DispatchQueue(label: "CodexOverlay.fullscreen", qos: .utility)
     private var refreshTimer: Timer?
+    private var activityTimer: Timer?
     private var fullscreenTimer: Timer?
     private var fullscreenCheckInFlight = false
     private var fullscreenExitSince: Date?
@@ -45,6 +46,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.performRefresh(forceReset: false)
         }
+        activityTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            self?.refreshActivity()
+        }
+        activityTimer?.tolerance = 0.5
         fullscreenTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             self?.updateFullscreenVisibility()
         }
@@ -117,12 +122,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func performRefresh(forceReset: Bool) {
         panel.restoreSavedSizeIfNeeded()
         panel.setConnection("正在读取 Codex 用量…")
-        sessionMonitor.scan { [weak self] snapshot in
-            guard let self else { return }
-            self.activity = snapshot
-            self.panel.setActivity(snapshot)
-            self.updateMenuTitle()
-        }
+        refreshActivity()
         usageClient.refresh { [weak self] result in
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -151,6 +151,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleClickThrough() {
         isClickThrough.toggle()
         panel.ignoresMouseEvents = isClickThrough
+    }
+
+    private func refreshActivity() {
+        sessionMonitor.scan { [weak self] snapshot in
+            guard let self else { return }
+            self.activity = snapshot
+            self.panel.setActivity(snapshot)
+            self.updateMenuTitle()
+        }
     }
 
     @objc private func toggleAutoHideInFullscreen() {
@@ -1358,13 +1367,10 @@ private struct ActivitySnapshot {
 
 private final class SessionMonitor {
     private static let maximumSessions = 60
-    // 只需找出最后一条任务生命周期事件；读取文件尾部足以避免每分钟重读数百 MB 的历史会话。
-    // 某些任务事件会落在超长 JSONL 记录中；1 MB 可覆盖该情况，且每轮最多读取 60 MB。
-    private static let tailByteLimit = 1024 * 1024
 
     private let queue = DispatchQueue(label: "CodexOverlay.sessionMonitor", qos: .utility)
     private var isScanning = false
-    private var eventCache: [URL: (modified: Date, size: Int, event: String?)] = [:]
+    private var eventCache: [URL: (modified: Date, size: Int, state: SessionLifecycle)] = [:]
 
     func scan(completion: @escaping (ActivitySnapshot) -> Void) {
         // 所有调用来自 AppKit 主线程。进行中的扫描不再排队，保留最近一次已知状态即可。
@@ -1406,16 +1412,24 @@ private final class SessionMonitor {
         eventCache = eventCache.filter { retainedURLs.contains($0.key) }
         var active = 0
         var stale = 0
+        var unreadable = 0
         let now = Date()
         for session in latest {
             let event: String?
             if let cached = eventCache[session.url],
                cached.modified == session.modified, cached.size == session.size {
-                event = cached.event
+                event = cached.state.event
             } else {
-                event = Self.lastLifecycleEvent(in: session.url)
-                eventCache[session.url] = (session.modified, session.size, event)
+                let cached = eventCache[session.url]
+                let previous = cached.flatMap { session.size >= $0.size ? $0.state : nil }
+                guard let state = SessionLifecycle.read(session.url, previous: previous) else {
+                    unreadable += 1
+                    continue
+                }
+                event = state.event
+                eventCache[session.url] = (session.modified, session.size, state)
             }
+            if event == nil { unreadable += 1 }
             guard event == "task_started" else { continue }
             if now.timeIntervalSince(session.modified) <= 12 * 3600 { active += 1 }
             else { stale += 1 }
@@ -1424,32 +1438,10 @@ private final class SessionMonitor {
         if active > 0 {
             return ActivitySnapshot(status: .running, title: active == 1 ? "执行中" : "执行中 × \(active)")
         }
-        if stale > 0 { return ActivitySnapshot(status: .unknown, title: "状态未知") }
+        if stale > 0 || unreadable > 0 { return ActivitySnapshot(status: .unknown, title: "状态未知") }
         return ActivitySnapshot(status: .idle, title: "空闲")
     }
 
-    private static func lastLifecycleEvent(in path: URL) -> String? {
-        guard let handle = try? FileHandle(forReadingFrom: path) else { return nil }
-        defer { try? handle.close() }
-
-        guard let fileSize = try? handle.seekToEnd() else { return nil }
-        let offset = fileSize > UInt64(tailByteLimit) ? fileSize - UInt64(tailByteLimit) : 0
-        guard (try? handle.seek(toOffset: offset)) != nil,
-              let data = try? handle.readToEnd(),
-              let text = String(data: data, encoding: .utf8) else { return nil }
-
-        // 倒序读取，找到最新事件就结束，避免对尾部所有 JSON 再做无意义解析。
-        for line in text.split(separator: "\n").reversed() {
-            guard let lineData = line.data(using: .utf8),
-                  let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                  object["type"] as? String == "event_msg",
-                  let payload = object["payload"] as? [String: Any],
-                  let type = payload["type"] as? String,
-                  ["task_started", "task_complete", "turn_aborted"].contains(type) else { continue }
-            return type
-        }
-        return nil
-    }
 }
 
 @main

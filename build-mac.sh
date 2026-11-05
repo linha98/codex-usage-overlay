@@ -14,6 +14,7 @@ rm -rf "$app_dir"
 mkdir -p "$binary_dir" "$resources_dir" "$iconset_dir"
 swiftc -O -parse-as-library -framework AppKit -framework ServiceManagement \
   "$project_dir/macos/CodexOverlay.swift" \
+  "$project_dir/macos/SessionLifecycle.swift" \
   -o "$binary_dir/CodexOverlay"
 cp "$project_dir/macos/Info.plist" "$app_dir/Contents/Info.plist"
 
